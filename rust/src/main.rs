@@ -51,6 +51,9 @@ fn main() {
 
         let code: Vec<u8> = hex::decode(&test.code.bin).unwrap();
 
+        // println!("test.code.bin: {:?}", test.code.bin);
+        // println!("code: {:?}", code);
+
         let result = evm(&code);
 
         let mut expected_stack: Vec<U256> = Vec::new();
@@ -61,6 +64,8 @@ fn main() {
         }
 
         let mut matching = result.stack.len() == expected_stack.len();
+        println!("result: {:?}", result);
+
         if matching {
             for i in 0..result.stack.len() {
                 if result.stack[i] != expected_stack[i] {
