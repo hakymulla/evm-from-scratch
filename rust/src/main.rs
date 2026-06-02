@@ -51,8 +51,8 @@ fn main() {
 
         let code: Vec<u8> = hex::decode(&test.code.bin).unwrap();
 
-        // println!("test.code.bin: {:?}", test.code.bin);
-        // println!("code: {:?}", code);
+        println!("test.code.bin: {:?}", test.code.bin); 
+        println!("code: {:?}", code);
 
         let result = evm(&code);
 
