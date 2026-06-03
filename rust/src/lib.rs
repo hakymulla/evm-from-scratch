@@ -43,6 +43,7 @@ enum Opcodes {
     NOT,
     SHL,
     SHR,
+    SAR,
     PUSH0,
     PUSHX,
     POP
@@ -77,6 +78,7 @@ impl TryFrom<&u8> for Opcodes {
             25 => Ok(Opcodes::NOT),
             27 => Ok(Opcodes::SHL),
             28 => Ok(Opcodes::SHR),
+            29 => Ok(Opcodes::SAR),
             95 => Ok(Opcodes::PUSH0),
             96..=127 => Ok(Opcodes::PUSHX),
             80 => Ok(Opcodes::POP),
@@ -415,6 +417,34 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
                  v.push(U256::zero());
             } else if a < U256::max_value() {
                 v.push(a>>shift);
+            }
+        },
+
+        Opcodes::SAR => {
+            println!("SHR");
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let (shift, a) = get_mut_val(&mut v);
+            
+            let sign_bit = a.bit(255);
+
+            if shift >= U256::from(256) {
+                if sign_bit {
+                    v.push(U256::max_value());
+                } else {
+                    v.push(U256::zero());
+                };
+            } else {
+                if !sign_bit {
+                    v.push(a >> shift);
+                } else {
+                    let shifted = a >> shift;
+
+                    let mask = U256::MAX << (U256::from(256) - shift);
+
+                    v.push(shifted | mask);
+                }
             }
         },
         
