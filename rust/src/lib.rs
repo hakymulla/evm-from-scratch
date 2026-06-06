@@ -1,8 +1,17 @@
 use core::num;
+use std::io::Read;
+use std::mem;
 use std::{ops::Div, str::FromStr};
 use std::{error::Error, fmt::Display};
 use primitive_types::U256;
 use serde_json::from_value;
+
+use std::sync::{Arc, Mutex};
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref MEMORY: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![]));
+}
 
 #[derive(Debug)]
 pub struct EvmResult {
@@ -41,12 +50,23 @@ enum Opcodes {
     OR,
     XOR,
     NOT,
+    BYTE,
     SHL,
     SHR,
     SAR,
+    JUMP,
+    PC,
     PUSH0,
     PUSHX,
-    POP
+    POP,
+    MLOAD,
+    MSTORE,
+    JUMPI,
+    GAS,
+    JUMPDEST,
+    DUP,
+    SWAP,
+    INVALID
 }
 
 impl TryFrom<&u8> for Opcodes {
@@ -76,12 +96,25 @@ impl TryFrom<&u8> for Opcodes {
             23 => Ok(Opcodes::OR),
             24 => Ok(Opcodes::XOR),
             25 => Ok(Opcodes::NOT),
+            26 => Ok(Opcodes::BYTE),
             27 => Ok(Opcodes::SHL),
             28 => Ok(Opcodes::SHR),
             29 => Ok(Opcodes::SAR),
+            86 => Ok(Opcodes::JUMP),
+            88 => Ok(Opcodes::PC),
+            80 => Ok(Opcodes::POP),
+            81 => Ok(Opcodes::MLOAD),
+            82 => Ok(Opcodes::MSTORE),
+            87 => Ok(Opcodes::JUMPI),
+            90 => Ok(Opcodes::GAS),
+            91 => Ok(Opcodes::JUMPDEST),
             95 => Ok(Opcodes::PUSH0),
             96..=127 => Ok(Opcodes::PUSHX),
-            80 => Ok(Opcodes::POP),
+            128..=143 => Ok(Opcodes::DUP),
+            144..=159 => Ok(Opcodes::SWAP),
+            254 => Ok(Opcodes::INVALID),
+
+
             _ => Err(EvmError::OpCodeError(value.to_string()))
         }
     }
@@ -89,12 +122,13 @@ impl TryFrom<&u8> for Opcodes {
 
 fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
     let mut code = code;
-    // println!("begininnng code: {:?}", code);
+    // let mut memory = vec![];
+
+    println!("begininnng code: {:?}", code);
     if code.is_empty() {
         return Some(v)
     }
 
-    pc += 1;
     let (opcode, _) = code.split_first().unwrap();
     println!("opcode: {}", opcode);
     let ops = Opcodes::try_from(opcode).expect("Invalid Opcode");
@@ -103,6 +137,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         Opcodes::STOP => return Some(v),
         Opcodes::ADD => {
             println!("ADD");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let (a, b) = get_mut_val(&mut v);
@@ -112,6 +147,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
 
         Opcodes::MUL => {
             println!("MUL");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let (a, b) = get_mut_val(&mut v);
@@ -120,6 +156,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
         Opcodes::SUB => {
             println!("SUB");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let (a, b) = get_mut_val(&mut v);
@@ -128,6 +165,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
         Opcodes::DIV => {
             println!("DIV");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let (a, b) = get_mut_val(&mut v);
@@ -142,6 +180,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
         Opcodes::SDIV => {
             println!("SDIV");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let (a, b) = get_mut_val(&mut v);
@@ -175,6 +214,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
 
         Opcodes::MOD => {
             println!("MOD");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let (a, b) = get_mut_val(&mut v);
@@ -188,6 +228,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
         Opcodes::SMOD => {
             println!("SMOD");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
@@ -207,6 +248,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
         Opcodes::ADDMOD => {
             println!("ADDMOD");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let (a, b, c) = get_three_mut_val(&mut v);
@@ -220,6 +262,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
         Opcodes::MULMOD => {
             println!("MULMOD");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let (a, b, c) = get_three_mut_val(&mut v);
@@ -229,6 +272,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
 
         Opcodes::EXP => {
             println!("EXP");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let (a, b) = get_mut_val(&mut v);
@@ -237,17 +281,15 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
         Opcodes::SIGNEXTEND => {
             println!("SIGNEXTEND");
-
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
-            let (a, b) = get_mut_val(&mut v);
+            let (_, b) = get_mut_val(&mut v);
 
             let mut bytes = [0u8; 32];
             b.to_big_endian(&mut bytes);
             
             let hex_string = hex::encode(&bytes);
-            println!("hex_string: {:?}", hex_string);
-
             let byte_count = (b.bits() + 7) / 8;
 
             // Check a specific bit (e.g. bit 15, the sign bit of a 16-bit int)
@@ -265,6 +307,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
         Opcodes::LT => {
             println!("LT");
+            pc += 1;
             // Some(("0x0".to_string(), 0))
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
@@ -279,6 +322,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
 
         Opcodes::GT => {
             println!("GT");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
@@ -292,18 +336,15 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
 
         Opcodes::SLT => {
             println!("SLT");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
             let (a, b) = get_mut_val(&mut v);
 
 
-            let (a_neg, a_mag) = to_signed(a);
-            let (b_neg, b_mag) = to_signed(b);
-            println!("a: {:?}", a);
-            println!("b: {:?}", b);
-            println!("a_neg: {:?}", a_neg);
-            println!("b_neg: {:?}", b_neg);
+            let (a_neg, _) = to_signed(a);
+            let (b_neg, _) = to_signed(b);
             if a_neg > b_neg {
                 v.push(U256::one());
             } else {
@@ -313,6 +354,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
 
         Opcodes::SGT => {
             println!("SGT");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
@@ -335,6 +377,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         
         Opcodes::EQ => {
             println!("EQ");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
@@ -348,6 +391,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
         Opcodes::ISZERO => {
             println!("ISZERO");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
@@ -361,6 +405,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
          Opcodes::AND => {
             println!("AND");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
@@ -369,6 +414,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
         Opcodes::OR => {
             println!("OR");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
@@ -377,6 +423,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
         Opcodes::XOR => {
             println!("XOR");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
@@ -385,6 +432,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
         Opcodes::NOT => {
             println!("NOT");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
@@ -392,8 +440,24 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
 
             v.push(!a);
         },
+        Opcodes::BYTE => {
+            println!("BYTE");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let (i, x) = get_mut_val(&mut v);
+
+            if i > U256::from(32){
+                v.push(U256::zero());
+            } else {
+                v.push((x >> (U256::from(248) - i*U256::from(8))) & U256::from_str("0xFF").unwrap());
+            }
+        },
+
         Opcodes::SHL => {
             println!("SHL");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
@@ -408,6 +472,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
 
         Opcodes::SHR => {
             println!("SHR");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
@@ -421,12 +486,13 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
 
         Opcodes::SAR => {
-            println!("SHR");
+            println!("SAR");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
             let (shift, a) = get_mut_val(&mut v);
-            
+
             let sign_bit = a.bit(255);
 
             if shift >= U256::from(256) {
@@ -447,23 +513,47 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
                 }
             }
         },
+
+        Opcodes::JUMP => {
+            println!("JUMP");
+
+            let (_, new_code) = get_n_bytes(&code, 1);
+            println!("code: {:?}", code);
+            println!("v: {:?}", v);
+            println!("new code: {:?}", new_code);
+            code = new_code;
+
+            let dst: usize = v.pop().unwrap().as_usize();
+            let result = jump(dst, pc, code);
+            match result {
+                Some(x) => {
+                    code = x;
+                }
+                None => return None
+            }
+        },
+
+        Opcodes::PC => {
+            println!("PC");
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+            println!("pc: {:?}", pc);
+            v.push(U256::from(pc));
+        },
         
         Opcodes::PUSH0 => {
             println!("PUSH0");
+            pc += 1;
             // Some(("0x0".to_string(), 0))
-            let (bytes, new_code) = get_n_bytes(&code, 1);
+            let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
-            println!("new_code: {:?}", new_code);
-            println!("bytes: {:?}", bytes);
             v.push(U256::from_str(&"0x0").unwrap());
         },
         Opcodes::PUSHX => {
             println!("PUSHX IN MATCHER");
             let push: usize  = (opcode - 95) as usize;
+            pc += push + 1;
             let (bytes, new_code) = get_n_bytes(&code, push + 1);
-            println!("new_code: {:?}", new_code);
-            println!("bytes: {:?}", bytes);
-            println!("push: {:?}", push);
             code = new_code;
             let (_, byte) = bytes.split_first().unwrap();
             // println!("push: {:?}", push);
@@ -475,9 +565,122 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
         },
         Opcodes::POP => {
             println!("POPPed");
+            pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let _ = v.pop();
+        },
+        Opcodes::MLOAD => {
+            println!("MLOAD");
+
+            pc += 1;
+
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let offset = get_one_mut_val(&mut v);
+            let offset = offset.as_usize();
+
+            let required = offset + 32;
+            let mut memory = MEMORY.lock().unwrap();
+            println!("memory: {:?}", memory);
+
+            if memory.len() < required {
+                memory.resize(required, 0u8); // new bytes = 0
+            }
+
+            // read 32 bytes and push onto stack
+            let word = U256::from_big_endian(&memory[offset..offset + 32]);
+            v.push(word);
+        },
+        Opcodes::MSTORE => {
+            println!("MSTORE");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let (offset, b) = get_mut_val(&mut v);
+
+            let mut bytes = [0_u8; 32];
+            b.to_big_endian(&mut bytes);
+            println!("a: {:?}", offset);
+            println!("b: {:?}", b);
+            println!("bytes: {:?}", bytes);
+
+            let offset = offset.as_usize();
+
+            let required = offset + 32;
+            let mut memory = MEMORY.lock().unwrap();
+            if memory[offset..].len() < required {
+                memory.resize(required, 0u8);
+            }
+            memory[offset..offset + 32].copy_from_slice(&bytes);
+            println!("memory: {:?}", memory);
+
+            let word = U256::from_big_endian(&memory[0..0 + 32]);
+            println!("word: {:?}", word);
+        },
+        Opcodes::JUMPI => {
+            println!("JUMPI");
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let (dst, condition) = get_mut_val(&mut v);
+            if condition == U256::zero() {
+                pc += 1;
+            } else {
+                let dst: usize = dst.as_usize();
+                let result = jump(dst, pc, code);
+                match result {
+                    Some(x) => {
+                        code = x;
+                    }
+                    None => return None
+                }
+            }
+        },
+        Opcodes::GAS => {
+            println!("GAS");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+            v.push(U256::from_str("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").unwrap());
+        },
+
+        Opcodes::JUMPDEST => {
+            println!("JUMPDEST");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+        },
+        Opcodes::DUP => {
+            println!("DUP");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let first_value = v.first().unwrap();
+            v.push(*first_value);
+        }
+        Opcodes::SWAP => {
+            println!("SWAP");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let first_value = v.first().unwrap().clone();
+            let last_value = v.last().unwrap().clone();
+            if let Some(first) = v.first_mut() {
+                *first = last_value;
+            }
+            v.pop().unwrap();
+            v.push(first_value);
+        },
+        Opcodes::INVALID => {
+            println!("INVALID");
+            return None;
+            // let (_, new_code) = get_n_bytes(&code, 1);
+            // code = new_code;
         }
         _ => {
             todo!();
@@ -487,6 +690,8 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>) -> Option<Vec<U256>> {
     run(&code, pc, v)
     // Some(v)
 }
+
+
 fn get_one_mut_val(v: &mut Vec<U256>) -> U256 {
     let a = v.pop().unwrap();
     a
@@ -508,29 +713,54 @@ fn get_three_mut_val(v: &mut Vec<U256>) -> (U256, U256, U256) {
 
 pub fn evm(_code: impl AsRef<[u8]>) -> EvmResult {
     let stack: Vec<U256> = Vec::new();
-    let mut v: Vec<U256> = vec![];
+    let v: Vec<U256> = vec![];
 
-    let mut pc = 0;
+    let pc = 0;
 
     let code = _code.as_ref();
     let mut evm_result = EvmResult{stack: vec![], success: true};
 
     while pc < code.len() {
-        let opcode = code[pc];
+        // let opcode = code[pc];
         let res = run(code, pc, v);
 
-        if let Some(mut value) = res {
-            value.reverse();
-            evm_result.stack = value
+        match res {
+            Some(mut value) => {
+                value.reverse();
+                evm_result.stack = value
+            },
+            None => {
+                evm_result.success = false
+            }
         }
-
         return evm_result;
     }
 
     return EvmResult {
         stack: stack,
-        success: true,
+        success: false,
     };
+}
+
+fn jump(dst: usize, mut pc: usize, mut code: &[u8]) -> Option<&[u8]>{
+     if dst > (code.len() + pc) {
+        return None;
+    }
+
+    if code[dst - pc - 1] != 91 {
+        return None;
+    }
+
+    println!("code[dst - pc - 1]: {:?}", code[dst - pc - 2]);
+    if code[dst - pc - 2] >= 96 && code[dst - pc - 2] <= 127 {
+        return None;
+    }
+
+    let (_, new_code) = code.split_at(dst - pc);
+    code = new_code;
+
+    pc += dst;
+    Some(code)
 }
 
 
