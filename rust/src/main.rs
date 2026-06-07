@@ -16,13 +16,17 @@
 use evm::evm;
 use primitive_types::U256;
 use serde::Deserialize;
-
+use std::collections::HashMap;
 #[derive(Debug, Deserialize)]
 struct Evmtest {
     name: String,
     hint: String,
     code: Code,
     expect: Expect,
+    tx: Option<serde_json::Value>, 
+    block: Option<serde_json::Value>,
+    state: Option<serde_json::Value> 
+
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,11 +54,17 @@ fn main() {
         println!("Test {} of {}: {}", index + 1, total, test.name);
 
         let code: Vec<u8> = hex::decode(&test.code.bin).unwrap();
+        let tx = &test.tx;
+        let block = &test.block;
+        let state = &test.state;
+        println!("tx: {:?}", tx);
+        println!("block: {:?}", block);
+
 
         println!("test.code.bin: {:?}", test.code.bin); 
         println!("code: {:?}", code);
 
-        let result = evm(&code);
+        let result = evm(&code, tx, block, state);
 
         let mut expected_stack: Vec<U256> = Vec::new();
         if let Some(ref stacks) = test.expect.stack {
