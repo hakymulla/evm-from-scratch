@@ -12,7 +12,6 @@
  * gave up and switched to JavaScript, Python, or Go. If you are new
  * to Rust, implement EVM in another programming language first.
  */
-
 use evm::evm;
 use primitive_types::U256;
 use serde::Deserialize;
@@ -23,10 +22,9 @@ struct Evmtest {
     hint: String,
     code: Code,
     expect: Expect,
-    tx: Option<serde_json::Value>, 
+    tx: Option<serde_json::Value>,
     block: Option<serde_json::Value>,
-    state: Option<serde_json::Value> 
-
+    state: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,7 +40,6 @@ struct Expect {
     // #[serde(rename = "return")]
     // ret: Option<String>,
 }
-
 
 fn main() {
     let text = std::fs::read_to_string("../evm.json").unwrap();
@@ -60,8 +57,7 @@ fn main() {
         println!("tx: {:?}", tx);
         println!("block: {:?}", block);
 
-
-        println!("test.code.bin: {:?}", test.code.bin); 
+        println!("test.code.bin: {:?}", test.code.bin);
         println!("code: {:?}", code);
 
         let result = evm(&code, tx, block, state);
@@ -84,7 +80,7 @@ fn main() {
                 }
             }
         }
-        
+
         matching = matching && result.success == test.expect.success;
 
         if !matching {
@@ -96,7 +92,7 @@ fn main() {
                 println!("  {:#X},", v);
             }
             println!("]\n");
-            
+
             println!("Actual success: {:?}", result.success);
             println!("Actual stack: [");
             for v in result.stack {

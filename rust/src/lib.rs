@@ -1,21 +1,16 @@
-use core::num;
-use std::io::Read;
-use std::mem;
-use std::os::macos::raw::stat;
-use std::{ops::Div, str::FromStr};
-use std::{error::Error, fmt::Display};
-use primitive_types::U256;
-use serde::de::value;
-use serde_json::{Value, from_value};
-use serde_json::map::Values;
+mod utils;
 
-use std::sync::{Arc, Mutex};
-use lazy_static::lazy_static;
+use std::{ops::Div, str::FromStr};
+
 use keccak_hash::{self, keccak};
-lazy_static! {
-    static ref MEMORY: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![]));
-    static ref MSIZE: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
-}
+use primitive_types::U256;
+use serde_json::Value;
+
+use utils::{
+    get_blockchain_data, get_mut_val, get_n_bytes, get_one_mut_val, get_state_data,
+    get_three_mut_val, jump, reset_memory_var, reset_msize_var, to_signed, to_unsigned, MEMORY,
+    MSIZE,
+};
 
 #[derive(Debug)]
 pub struct EvmResult {
@@ -23,12 +18,10 @@ pub struct EvmResult {
     pub success: bool,
 }
 
-
 #[derive(Debug)]
 enum EvmError {
     OpCodeError(String),
 }
-
 
 #[derive(Debug)]
 enum Opcodes {
@@ -67,6 +60,8 @@ enum Opcodes {
     CALLDATALOAD,
     CALLDATASIZE,
     CALLDATACOPY,
+    CODESIZE,
+    CODECOPY,
     GASPRICE,
     BLOCKHASH,
     COINBASE,
@@ -90,7 +85,7 @@ enum Opcodes {
     JUMPDEST,
     DUP,
     SWAP,
-    INVALID
+    INVALID,
 }
 
 impl TryFrom<&u8> for Opcodes {
@@ -133,6 +128,8 @@ impl TryFrom<&u8> for Opcodes {
             53 => Ok(Opcodes::CALLDATALOAD),
             54 => Ok(Opcodes::CALLDATASIZE),
             55 => Ok(Opcodes::CALLDATACOPY),
+            56 => Ok(Opcodes::CODESIZE),
+            57 => Ok(Opcodes::CODECOPY),
             58 => Ok(Opcodes::GASPRICE),
             64 => Ok(Opcodes::BLOCKHASH),
             65 => Ok(Opcodes::COINBASE),
@@ -158,18 +155,25 @@ impl TryFrom<&u8> for Opcodes {
             144..=159 => Ok(Opcodes::SWAP),
             254 => Ok(Opcodes::INVALID),
 
-
-            _ => Err(EvmError::OpCodeError(value.to_string()))
+            _ => Err(EvmError::OpCodeError(value.to_string())),
         }
     }
 }
 
-fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: &Option<Value>, state: &Option<Value>) -> Option<Vec<U256>> {
+fn run(
+    code: &[u8],
+    mut pc: usize,
+    original_code: &[u8],
+    mut v: Vec<U256>,
+    tx: &Option<Value>,
+    block: &Option<Value>,
+    state: &Option<Value>,
+) -> Option<Vec<U256>> {
     let mut code = code;
 
     println!("begininnng code: {:?}", code);
     if code.is_empty() {
-        return Some(v)
+        return Some(v);
     }
 
     let (opcode, _) = code.split_first().unwrap();
@@ -184,9 +188,9 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let (a, b) = get_mut_val(&mut v);
-            let res =  a.overflowing_add(b);
+            let res = a.overflowing_add(b);
             v.push(res.0);
-        },
+        }
 
         Opcodes::MUL => {
             println!("MUL");
@@ -194,9 +198,9 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let (a, b) = get_mut_val(&mut v);
-            let res =  a.overflowing_mul(b);
+            let res = a.overflowing_mul(b);
             v.push(res.0);
-        },
+        }
         Opcodes::SUB => {
             println!("SUB");
             pc += 1;
@@ -205,7 +209,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             let (a, b) = get_mut_val(&mut v);
             let res = a.overflowing_sub(b);
             v.push(res.0);
-        },
+        }
         Opcodes::DIV => {
             println!("DIV");
             pc += 1;
@@ -220,7 +224,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
                 let res = a.div(b);
                 v.push(res);
             }
-        },
+        }
         Opcodes::SDIV => {
             println!("SDIV");
             pc += 1;
@@ -234,7 +238,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
 
             // RULE 3: overflow special case
             // -2²⁵⁵ / -1 → return -2²⁵⁵ (same bits back)
-            let min_value = U256::one() << 255;  // 0x80...00
+            let min_value = U256::one() << 255; // 0x80...00
 
             if b == U256::zero() {
                 v.push(U256::zero());
@@ -242,7 +246,6 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
                 // return min_value; // bits of -2²⁵⁵
                 v.push(min_value);
             } else {
-
                 // RULE 4: divide magnitudes
                 let result_mag = a_mag / b_mag;
 
@@ -253,7 +256,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
                 let res = to_unsigned(result_neg, result_mag);
                 v.push(res);
             }
-        },
+        }
 
         Opcodes::MOD => {
             println!("MOD");
@@ -267,8 +270,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
                 let res = a.div_mod(b);
                 v.push(res.1);
             }
-            
-        },
+        }
         Opcodes::SMOD => {
             println!("SMOD");
             pc += 1;
@@ -287,8 +289,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
                 let res = to_unsigned(result_neg, result_mag);
                 v.push(res);
             }
-            
-        },
+        }
         Opcodes::ADDMOD => {
             println!("ADDMOD");
             pc += 1;
@@ -299,10 +300,8 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             let res = (a.saturating_add(b)).div_mod(c);
             println!("res: {:?}", res);
 
-
             v.push(res.1);
-            
-        },
+        }
         Opcodes::MULMOD => {
             println!("MULMOD");
             pc += 1;
@@ -311,7 +310,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             let (a, b, c) = get_three_mut_val(&mut v);
             let res = ((a % c) * (b % c)) % c;
             v.push(res);
-        },
+        }
 
         Opcodes::EXP => {
             println!("EXP");
@@ -321,7 +320,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             let (a, b) = get_mut_val(&mut v);
             let res = a.pow(b);
             v.push(res);
-        },
+        }
         Opcodes::SIGNEXTEND => {
             println!("SIGNEXTEND");
             pc += 1;
@@ -331,14 +330,14 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
 
             let mut bytes = [0u8; 32];
             b.to_big_endian(&mut bytes);
-            
+
             let hex_string = hex::encode(&bytes);
             let byte_count = (b.bits() + 7) / 8;
 
             // Check a specific bit (e.g. bit 15, the sign bit of a 16-bit int)
             let bit_shift = 7 * byte_count + (byte_count - 1);
             let bit = (b.as_usize() >> bit_shift) & 1;
-            
+
             if bit == 1 {
                 let hex_string = hex_string.replacen("00", "ff", 32 - byte_count);
                 v.push(U256::from_str(&hex_string).unwrap());
@@ -347,7 +346,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
                 println!("b_decoded: {:?}", b_decoded);
                 v.push(U256::from_str(&hex_string).unwrap());
             }
-        },
+        }
         Opcodes::LT => {
             println!("LT");
             pc += 1;
@@ -361,7 +360,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             } else {
                 v.push(U256::zero());
             }
-        },
+        }
 
         Opcodes::GT => {
             println!("GT");
@@ -375,7 +374,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             } else {
                 v.push(U256::zero());
             }
-        },
+        }
 
         Opcodes::SLT => {
             println!("SLT");
@@ -385,7 +384,6 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
 
             let (a, b) = get_mut_val(&mut v);
 
-
             let (a_neg, _) = to_signed(a);
             let (b_neg, _) = to_signed(b);
             if a_neg > b_neg {
@@ -393,7 +391,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             } else {
                 v.push(U256::zero());
             }
-        },
+        }
 
         Opcodes::SGT => {
             println!("SGT");
@@ -416,8 +414,8 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
                     v.push(U256::zero());
                 }
             }
-        },
-        
+        }
+
         Opcodes::EQ => {
             println!("EQ");
             pc += 1;
@@ -431,7 +429,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             } else {
                 v.push(U256::zero());
             }
-        },
+        }
         Opcodes::ISZERO => {
             println!("ISZERO");
             pc += 1;
@@ -445,16 +443,16 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             } else {
                 v.push(U256::zero());
             }
-        },
-         Opcodes::AND => {
+        }
+        Opcodes::AND => {
             println!("AND");
             pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
             let (a, b) = get_mut_val(&mut v);
-            v.push(a&b);
-        },
+            v.push(a & b);
+        }
         Opcodes::OR => {
             println!("OR");
             pc += 1;
@@ -462,8 +460,8 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
 
             let (a, b) = get_mut_val(&mut v);
-            v.push(a|b);
-        },
+            v.push(a | b);
+        }
         Opcodes::XOR => {
             println!("XOR");
             pc += 1;
@@ -471,8 +469,8 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
 
             let (a, b) = get_mut_val(&mut v);
-            v.push(a^b);
-        },
+            v.push(a ^ b);
+        }
         Opcodes::NOT => {
             println!("NOT");
             pc += 1;
@@ -482,7 +480,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             let a = get_one_mut_val(&mut v);
 
             v.push(!a);
-        },
+        }
         Opcodes::BYTE => {
             println!("BYTE");
             pc += 1;
@@ -491,12 +489,14 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
 
             let (i, x) = get_mut_val(&mut v);
 
-            if i > U256::from(32){
+            if i > U256::from(32) {
                 v.push(U256::zero());
             } else {
-                v.push((x >> (U256::from(248) - i*U256::from(8))) & U256::from_str("0xFF").unwrap());
+                v.push(
+                    (x >> (U256::from(248) - i * U256::from(8))) & U256::from_str("0xFF").unwrap(),
+                );
             }
-        },
+        }
 
         Opcodes::SHL => {
             println!("SHL");
@@ -507,11 +507,11 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             let (shift, a) = get_mut_val(&mut v);
 
             if shift >= U256::from(256) {
-                 v.push(U256::zero());
+                v.push(U256::zero());
             } else if a < U256::max_value() {
-                v.push(a<<shift);
+                v.push(a << shift);
             }
-        },
+        }
 
         Opcodes::SHR => {
             println!("SHR");
@@ -522,11 +522,11 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             let (shift, a) = get_mut_val(&mut v);
 
             if shift >= U256::from(256) {
-                 v.push(U256::zero());
+                v.push(U256::zero());
             } else if a < U256::max_value() {
-                v.push(a>>shift);
+                v.push(a >> shift);
             }
-        },
+        }
 
         Opcodes::SAR => {
             println!("SAR");
@@ -555,7 +555,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
                     v.push(shifted | mask);
                 }
             }
-        },
+        }
 
         Opcodes::SHA3 => {
             println!("SHA3");
@@ -566,10 +566,10 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             let (offset, length) = get_mut_val(&mut v);
             let offset = offset.as_usize();
             let memory = MEMORY.lock().unwrap();
-            let byte = &memory[offset..offset+length.as_usize()];
+            let byte = &memory[offset..offset + length.as_usize()];
             let keccak_hash = keccak(byte);
             v.push(U256::from(keccak_hash.0));
-        },
+        }
 
         Opcodes::ADDRESS => {
             println!("ADDRESS");
@@ -578,11 +578,11 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
 
             let value = get_blockchain_data(tx, "to");
-            
-            v.push(value);
-        },
 
-         Opcodes::BALANCE => {
+            v.push(value);
+        }
+
+        Opcodes::BALANCE => {
             println!("BALANCE");
             pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
@@ -591,16 +591,12 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             let address = get_one_mut_val(&mut v);
             let address = format!("0x{:x}", address);
             let balance = match state {
-                Some(value) => {
-                    get_state_data(value, &address, "balance")
-                },
-                None => {
-                    U256::zero()
-                }
+                Some(value) => get_state_data(value, &address, "balance"),
+                None => U256::zero(),
             };
-            
+
             v.push(balance);
-        },
+        }
 
         Opcodes::ORIGIN => {
             println!("ORIGIN");
@@ -609,9 +605,9 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
 
             let value = get_blockchain_data(tx, "origin");
-            
+
             v.push(value);
-        },
+        }
 
         Opcodes::CALLER => {
             println!("CALLER");
@@ -620,9 +616,9 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
 
             let value = get_blockchain_data(tx, "from");
-            
+
             v.push(value);
-        },
+        }
 
         Opcodes::CALLVALUE => {
             println!("CALLVALUE");
@@ -631,9 +627,9 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
 
             let value = get_blockchain_data(tx, "value");
-            
+
             v.push(value);
-        },
+        }
 
         Opcodes::CALLDATALOAD => {
             println!("CALLDATALOAD");
@@ -648,17 +644,17 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             let data = hex::decode(value_str).unwrap();
 
             let mut buf = [0u8; 32];
-                for i in 0..32 {
-                    let data_idx = idx + i;
-                    if data_idx < data.len() {
-                        buf[i] = data[data_idx];
-                    }
+            for i in 0..32 {
+                let data_idx = idx + i;
+                if data_idx < data.len() {
+                    buf[i] = data[data_idx];
                 }
+            }
 
             let result = format!("{:x}", U256::from_big_endian(&buf));
             let u256_value = U256::from_str(&result).unwrap();
             v.push(u256_value);
-        },
+        }
 
         Opcodes::CALLDATASIZE => {
             println!("CALLDATASIZE");
@@ -666,17 +662,16 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-
             let size = match tx {
                 Some(tx) => {
                     let data = get_blockchain_data(&Some(tx.clone()), "data");
                     let data_str = format!("000{:x}", data);
                     data_str.len() / 2
-                },
-                None => 0
+                }
+                None => 0,
             };
             v.push(U256::from(size));
-        },
+        }
 
         Opcodes::CALLDATACOPY => {
             println!("CALLDATACOPY");
@@ -689,13 +684,55 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             let mut bytes = [0u8; 32];
             data.to_big_endian(&mut bytes);
 
-            let first_n = &bytes[ost.as_usize()..ost.as_usize()+len.as_usize()];
+            let first_n = &bytes[ost.as_usize()..ost.as_usize() + len.as_usize()];
             let mut memory = MEMORY.lock().unwrap();
+            let mut msize = MSIZE.lock().unwrap();
             if memory.len() < dst_ost.as_usize() + len.as_usize() {
                 memory.resize(first_n.len(), 0u8);
+                *msize = first_n.len();
             }
             memory[dst_ost.as_usize()..].copy_from_slice(first_n);
-        },
+        }
+
+        Opcodes::CODESIZE => {
+            println!("CODESIZE");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+            v.push(U256::from(original_code.len()));
+        }
+
+        Opcodes::CODECOPY => {
+            println!("CODECOPY");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let (dst_ost, ost, len) = get_three_mut_val(&mut v);
+            let dst_ost = dst_ost.as_usize();
+            let ost = ost.as_usize();
+            let len = len.as_usize();
+
+            let mut original_code_vec: Vec<u8> = vec![0; 32];
+            if original_code.len() > 32 {
+                original_code_vec.resize((original_code.len() / 33 + 1) * 32, 0);
+            }
+
+            original_code_vec[..original_code.len()].copy_from_slice(original_code);
+
+            let mut memory = MEMORY.lock().unwrap();
+
+            // let mut msize = MSIZE.lock().unwrap(); // TODO
+            let resize = ((dst_ost + 32) / 33 + 1) * 32;
+
+            if memory.len() < dst_ost + len {
+                memory.resize(resize, 0u8);
+                // *msize = first_n.len();
+            }
+
+            memory[dst_ost..dst_ost + len].copy_from_slice(&original_code_vec[ost..ost + len]);
+            println!("memory: {:?}", memory);
+        }
 
         Opcodes::GASPRICE => {
             println!("GASPRICE");
@@ -704,9 +741,9 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
 
             let value = get_blockchain_data(tx, "gasprice");
-            
+
             v.push(value);
-        },
+        }
         Opcodes::BASEFEE => {
             println!("BASEFEE");
             pc += 1;
@@ -714,20 +751,20 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
 
             let value = get_blockchain_data(block, "basefee");
-            
-            v.push(value);
-        },
 
-         Opcodes::BLOCKHASH => {
+            v.push(value);
+        }
+
+        Opcodes::BLOCKHASH => {
             println!("BLOCKHASH");
             pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
             let _ = get_one_mut_val(&mut v);
-            
+
             v.push(U256::zero());
-        },
+        }
 
         Opcodes::COINBASE => {
             println!("COINBASE");
@@ -736,9 +773,9 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
 
             let value = get_blockchain_data(block, "coinbase");
-            
+
             v.push(value);
-        },
+        }
 
         Opcodes::TIMESTAMP => {
             println!("TIMESTAMP");
@@ -747,9 +784,9 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
 
             let value = get_blockchain_data(block, "timestamp");
-            
+
             v.push(value);
-        },
+        }
         Opcodes::NUMBER => {
             println!("NUMBER");
             pc += 1;
@@ -757,9 +794,9 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
 
             let value = get_blockchain_data(block, "number");
-            
+
             v.push(value);
-        },
+        }
         Opcodes::DIFFICULTY => {
             println!("DIFFICULTY");
             pc += 1;
@@ -767,9 +804,9 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
 
             let value = get_blockchain_data(block, "difficulty");
-            
+
             v.push(value);
-        },
+        }
         Opcodes::GASLIMIT => {
             println!("GASLIMIT");
             pc += 1;
@@ -777,9 +814,9 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
 
             let value = get_blockchain_data(block, "gaslimit");
-            
+
             v.push(value);
-        },
+        }
         Opcodes::CHAINID => {
             println!("CHAINID");
             pc += 1;
@@ -787,9 +824,9 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
 
             let value = get_blockchain_data(block, "chainid");
-            
+
             v.push(value);
-        },
+        }
 
         Opcodes::JUMP => {
             println!("JUMP");
@@ -806,9 +843,9 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
                 Some(x) => {
                     code = x;
                 }
-                None => return None
+                None => return None,
             }
-        },
+        }
 
         Opcodes::PC => {
             println!("PC");
@@ -816,42 +853,34 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             code = new_code;
             println!("pc: {:?}", pc);
             v.push(U256::from(pc));
-        },
-        
+        }
+
         Opcodes::PUSH0 => {
             println!("PUSH0");
             pc += 1;
-            // Some(("0x0".to_string(), 0))
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             v.push(U256::from_str(&"0x0").unwrap());
-        },
+        }
         Opcodes::PUSHX => {
             println!("PUSHX IN MATCHER");
-            let push: usize  = (opcode - 95) as usize;
+            let push: usize = (opcode - 95) as usize;
             pc += push + 1;
             let (bytes, new_code) = get_n_bytes(&code, push + 1);
             code = new_code;
             let (_, byte) = bytes.split_first().unwrap();
-            // println!("push: {:?}", push);
             let enc = hex::encode(&byte);
-            // println!("byte: {:?}", byte);
-            // println!("enc: {:?}", enc);
-            // println!("U256::from_str(&enc): {:?}", U256::from_str(&enc));
-            // Some((enc, push))
             v.push(U256::from_str(&enc).unwrap());
-            // used_byte = push;
-        },
+        }
         Opcodes::POP => {
             println!("POPPed");
             pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let _ = v.pop();
-        },
+        }
         Opcodes::MLOAD => {
             println!("MLOAD");
-
             pc += 1;
 
             let (_, new_code) = get_n_bytes(&code, 1);
@@ -859,28 +888,30 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
 
             let offset = get_one_mut_val(&mut v);
             let offset = offset.as_usize();
+            println!("offset: {}", offset);
 
-            let required = ((offset + 32)/33 + 1) * 32;
-            println!("offset: {:?}", offset);
-            println!("required: {:?}", required);
+            let required = ((offset + 32) / 33 + 1) * 32;
+            println!("required: {}", (offset + 32));
+            println!("required: {}", (offset + 32) / 33);
+            println!("required: {}", (offset + 32) / 33 + 1);
+            println!("required: {}", ((offset + 32) / 33 + 1) * 32);
 
             let mut memory = MEMORY.lock().unwrap();
             let mut msize = MSIZE.lock().unwrap();
-            println!("memory: {:?}", memory);
-            println!("msize: {:?}", msize);
-
+            println!("required: {}", required);
             if memory.len() < required {
                 memory.resize(required, 0u8);
                 *msize = required;
             }
-            println!("memory len: {:?}", memory.len());
-            println!("memory: {:?}", &memory[offset..]);
-            println!("memory: {:?}", &memory[offset..offset+32]);
 
-            let word = U256::from_big_endian(&memory[offset..offset+32]);
-            v.push(word);
+            let word = U256::from_big_endian(&memory[offset..offset + 32]);
+            println!(
+                "&memory[offset..offset + 32]: {:?}",
+                &memory[offset..offset + 32]
+            );
             println!("word: {:?}", word);
-        },
+            v.push(word);
+        }
         Opcodes::MSTORE => {
             println!("MSTORE");
             pc += 1;
@@ -899,7 +930,7 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
                 memory.resize(required, 0u8);
             }
             memory[offset..offset + 32].copy_from_slice(&bytes);
-        },
+        }
 
         Opcodes::MSTORE8 => {
             println!("MSTORE8");
@@ -920,9 +951,8 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
                 memory.resize(size, 0u8);
                 *msize = size;
             }
-            // memory[offset] = value.byte(0);
             memory[offset..].copy_from_slice(&bytes[..1]);
-        },
+        }
         Opcodes::JUMPI => {
             println!("JUMPI");
             let (_, new_code) = get_n_bytes(&code, 1);
@@ -938,10 +968,10 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
                     Some(x) => {
                         code = x;
                     }
-                    None => return None
+                    None => return None,
                 }
             }
-        },
+        }
         Opcodes::MSIZE => {
             println!("MSIZE");
             let (_, new_code) = get_n_bytes(&code, 1);
@@ -949,22 +979,26 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
 
             let msize = MSIZE.lock().unwrap();
             v.push(U256::from(*msize));
-
-        },
+        }
         Opcodes::GAS => {
             println!("GAS");
             pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
-            v.push(U256::from_str("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").unwrap());
-        },
+            v.push(
+                U256::from_str(
+                    "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                )
+                .unwrap(),
+            );
+        }
 
         Opcodes::JUMPDEST => {
             println!("JUMPDEST");
             pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
-        },
+        }
         Opcodes::DUP => {
             println!("DUP");
             pc += 1;
@@ -987,65 +1021,49 @@ fn run(code: &[u8], mut pc: usize, mut v: Vec<U256>, tx: &Option<Value>, block: 
             }
             v.pop().unwrap();
             v.push(first_value);
-        },
+        }
         Opcodes::INVALID => {
             println!("INVALID");
             return None;
-            // let (_, new_code) = get_n_bytes(&code, 1);
-            // code = new_code;
         }
         _ => {
             todo!();
         }
     }
 
-    run(&code, pc, v, tx, block, state)
-    // Some(v)
+    run(&code, pc, original_code, v, tx, block, state)
 }
 
-
-fn get_one_mut_val(v: &mut Vec<U256>) -> U256 {
-    let a = v.pop().unwrap();
-    a
-}
-
-fn get_mut_val(v: &mut Vec<U256>) -> (U256, U256) {
-    let a = v.pop().unwrap();
-    let b = v.pop().unwrap();
-    (a, b)
-}
-
-fn get_three_mut_val(v: &mut Vec<U256>) -> (U256, U256, U256) {
-    let a = v.pop().unwrap();
-    let b = v.pop().unwrap();
-    let c = v.pop().unwrap();
-    (a, b, c)
-}
-
-
-pub fn evm(_code: impl AsRef<[u8]>, tx: &Option<Value>, block: &Option<Value>, state: &Option<Value>) -> EvmResult {
+pub fn evm(
+    code: impl AsRef<[u8]>,
+    tx: &Option<Value>,
+    block: &Option<Value>,
+    state: &Option<Value>,
+) -> EvmResult {
     let stack: Vec<U256> = Vec::new();
     let v: Vec<U256> = vec![];
 
     let pc = 0;
+    let code = code.as_ref();
+    let original_code = code.clone();
 
-    let code = _code.as_ref();
-    let mut evm_result = EvmResult{stack: vec![], success: true};
+    let mut evm_result = EvmResult {
+        stack: vec![],
+        success: true,
+    };
     reset_memory_var();
     reset_msize_var();
 
     while pc < code.len() {
         // let opcode = code[pc];
-        let res = run(code, pc, v, tx, block, state);
+        let res = run(code, pc, original_code, v, tx, block, state);
 
         match res {
             Some(mut value) => {
                 value.reverse();
                 evm_result.stack = value
-            },
-            None => {
-                evm_result.success = false
             }
+            None => evm_result.success = false,
         }
         return evm_result;
     }
@@ -1055,94 +1073,3 @@ pub fn evm(_code: impl AsRef<[u8]>, tx: &Option<Value>, block: &Option<Value>, s
         success: false,
     };
 }
-
-fn jump(dst: usize, mut pc: usize, mut code: &[u8]) -> Option<&[u8]>{
-     if dst > (code.len() + pc) {
-        return None;
-    }
-
-    if code[dst - pc - 1] != 91 {
-        return None;
-    }
-
-    println!("code[dst - pc - 1]: {:?}", code[dst - pc - 2]);
-    if code[dst - pc - 2] >= 96 && code[dst - pc - 2] <= 127 {
-        return None;
-    }
-
-    let (_, new_code) = code.split_at(dst - pc);
-    code = new_code;
-
-    pc += dst;
-    Some(code)
-}
-
-
-fn get_n_bytes(value: &[u8], byte: usize) -> (&[u8], &[u8]) {
-    (&value[..byte],  &value[byte..])
-}
-
-fn from_bits(bits: Vec<u8>) -> u8 {
-    let mut v = 0;
-    for (i, bit) in bits.iter().enumerate() {
-        v |= bit << (7 - i);
-    }
-    v
-}
-
-fn to_bits(v: u8) -> [u8; 8] {
-    let mut bits = [0; 8];
-    for (i, bit) in bits.iter_mut().enumerate() {
-        *bit = (v >> (7 - i)) & 1;
-    }
-    bits
-}
-
-fn to_signed(x: U256) -> (bool, U256) {
-    let sign_bit = x.bit(255);
-
-    if !sign_bit {
-        // positive, magnitude is just x
-        (false, x)
-    } else {
-        // negative, two's complement to get magnitude
-        let magnitude = (!x) + U256::one();
-        (true, magnitude)
-    }
-}
-
-fn to_unsigned(is_negative: bool, magnitude: U256) -> U256 {
-    if !is_negative {
-        // positive, bits are just the magnitude
-        magnitude
-    } else {
-        // negative, reverse two's complement
-        (!magnitude) + U256::one()
-    }
-}
-
-fn reset_memory_var() {
-    let mut value = MEMORY.lock().unwrap();
-    *value = vec![] // Reset to a new value
-}
-
-fn reset_msize_var() {
-    let mut value = MSIZE.lock().unwrap();
-    *value = 0 // Reset to a new value
-}
-
-fn get_blockchain_data(tx: &Option<Value>, value: &str) -> U256 {
-    let value_obj = tx.clone().unwrap();
-    let value_str = value_obj.get(value).unwrap();
-    let value_str = value_str.as_str().unwrap();
-    U256::from_str(value_str).unwrap()
-}
-
-fn get_state_data(state: &Value, address: &str, value: &str) -> U256 {
-    let value_obj = state.clone();
-    let address_obj = value_obj.get(address).unwrap();
-    let balance_obj = address_obj.get(value).unwrap();
-    let balance = balance_obj.as_str().unwrap();
-    U256::from_str(balance).unwrap()
-}
-
