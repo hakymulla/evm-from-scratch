@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
@@ -8,9 +9,10 @@ use serde_json::Value;
 lazy_static! {
     pub static ref MEMORY: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![]));
     pub static ref MSIZE: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    pub static ref STORAGE: Arc<Mutex<HashMap<U256, U256>>> = Arc::new(Mutex::new(HashMap::new()));
 }
 
-pub fn jump(dst: usize, mut pc: usize, mut code: &[u8]) -> Option<&[u8]> {
+pub fn jump(dst: usize, pc: usize, mut code: &[u8]) -> Option<&[u8]> {
     if dst > (code.len() + pc) {
         return None;
     }
@@ -27,7 +29,6 @@ pub fn jump(dst: usize, mut pc: usize, mut code: &[u8]) -> Option<&[u8]> {
     let (_, new_code) = code.split_at(dst - pc);
     code = new_code;
 
-    pc += dst;
     Some(code)
 }
 
@@ -83,6 +84,14 @@ pub fn get_state_data(state: &Value, address: &str, value: &str) -> U256 {
     U256::from_str(balance).unwrap()
 }
 
+pub fn get_bin_state_data<'a>(state: &'a Value, address: &'a str) -> &'a str {
+    let value_obj = state;
+    let address_obj = value_obj.get(address).unwrap();
+    let code_obj = address_obj.get("code").unwrap();
+    let bin_obj = code_obj.get("bin").unwrap().as_str().unwrap();
+    bin_obj
+}
+
 pub fn get_one_mut_val(v: &mut Vec<U256>) -> U256 {
     let a = v.pop().unwrap();
     a
@@ -99,4 +108,20 @@ pub fn get_three_mut_val(v: &mut Vec<U256>) -> (U256, U256, U256) {
     let b = v.pop().unwrap();
     let c = v.pop().unwrap();
     (a, b, c)
+}
+
+pub fn get_four_mut_val(v: &mut Vec<U256>) -> (U256, U256, U256, U256) {
+    let a = v.pop().unwrap();
+    let b = v.pop().unwrap();
+    let c = v.pop().unwrap();
+    let d = v.pop().unwrap();
+    (a, b, c, d)
+}
+
+// pub fn pop_v<const N: usize>(v: &mut Vec<U256>) -> [U256; N] {
+//     core::array::from_fn(|_| v.pop().unwrap())
+// }
+
+pub fn pop_v(v: &mut Vec<U256>, n: usize) -> Vec<U256> {
+    (0..n).map(|_| v.pop().unwrap()).collect()
 }

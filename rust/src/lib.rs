@@ -1,20 +1,32 @@
 mod utils;
 
-use std::{ops::Div, str::FromStr};
+use std::{ops::Div, str::FromStr, vec};
 
 use keccak_hash::{self, keccak};
 use primitive_types::U256;
 use serde_json::Value;
 
 use utils::{
-    get_blockchain_data, get_mut_val, get_n_bytes, get_one_mut_val, get_state_data,
-    get_three_mut_val, jump, reset_memory_var, reset_msize_var, to_signed, to_unsigned, MEMORY,
-    MSIZE,
+    get_bin_state_data, get_blockchain_data, get_four_mut_val, get_mut_val, get_n_bytes,
+    get_one_mut_val, get_state_data, get_three_mut_val, jump, reset_memory_var, reset_msize_var,
+    to_signed, to_unsigned, MEMORY, MSIZE, STORAGE,
 };
+
+use crate::utils::pop_v;
+use serde::Deserialize;
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct Log {
+    pub address: String,
+    pub data: String,
+    pub topics: Vec<String>,
+}
 
 #[derive(Debug)]
 pub struct EvmResult {
     pub stack: Vec<U256>,
+    pub logs: Vec<Log>,
+    pub ret: String,
     pub success: bool,
 }
 
@@ -63,6 +75,9 @@ enum Opcodes {
     CODESIZE,
     CODECOPY,
     GASPRICE,
+    EXTCODESIZE,
+    EXTCODECOPY,
+    EXTCODEHASH,
     BLOCKHASH,
     COINBASE,
     TIMESTAMP,
@@ -70,7 +85,10 @@ enum Opcodes {
     DIFFICULTY,
     GASLIMIT,
     CHAINID,
+    SELFBALANCE,
     BASEFEE,
+    SLOAD,
+    SSTORE,
     JUMP,
     PC,
     PUSH0,
@@ -85,6 +103,12 @@ enum Opcodes {
     JUMPDEST,
     DUP,
     SWAP,
+    LOG0,
+    LOG1,
+    LOGX,
+    // LOG3,
+    RETURN,
+    REVERT,
     INVALID,
 }
 
@@ -131,6 +155,9 @@ impl TryFrom<&u8> for Opcodes {
             56 => Ok(Opcodes::CODESIZE),
             57 => Ok(Opcodes::CODECOPY),
             58 => Ok(Opcodes::GASPRICE),
+            59 => Ok(Opcodes::EXTCODESIZE),
+            60 => Ok(Opcodes::EXTCODECOPY),
+            63 => Ok(Opcodes::EXTCODEHASH),
             64 => Ok(Opcodes::BLOCKHASH),
             65 => Ok(Opcodes::COINBASE),
             66 => Ok(Opcodes::TIMESTAMP),
@@ -138,7 +165,10 @@ impl TryFrom<&u8> for Opcodes {
             68 => Ok(Opcodes::DIFFICULTY),
             69 => Ok(Opcodes::GASLIMIT),
             70 => Ok(Opcodes::CHAINID),
+            71 => Ok(Opcodes::SELFBALANCE),
             72 => Ok(Opcodes::BASEFEE),
+            84 => Ok(Opcodes::SLOAD),
+            85 => Ok(Opcodes::SSTORE),
             86 => Ok(Opcodes::JUMP),
             88 => Ok(Opcodes::PC),
             80 => Ok(Opcodes::POP),
@@ -153,6 +183,12 @@ impl TryFrom<&u8> for Opcodes {
             96..=127 => Ok(Opcodes::PUSHX),
             128..=143 => Ok(Opcodes::DUP),
             144..=159 => Ok(Opcodes::SWAP),
+            160 => Ok(Opcodes::LOG0),
+            161 => Ok(Opcodes::LOG1),
+            162..=164 => Ok(Opcodes::LOGX),
+            // 163 => Ok(Opcodes::LOG3),
+            243 => Ok(Opcodes::RETURN),
+            253 => Ok(Opcodes::REVERT),
             254 => Ok(Opcodes::INVALID),
 
             _ => Err(EvmError::OpCodeError(value.to_string())),
@@ -165,15 +201,23 @@ fn run(
     mut pc: usize,
     original_code: &[u8],
     mut v: Vec<U256>,
+    mut logs: Vec<Log>,
+    mut ret: String,
     tx: &Option<Value>,
     block: &Option<Value>,
     state: &Option<Value>,
-) -> Option<Vec<U256>> {
+    // ) -> Option<Vec<U256>> {
+) -> Option<ExpectData> {
     let mut code = code;
 
     println!("begininnng code: {:?}", code);
     if code.is_empty() {
-        return Some(v);
+        let r = ExpectData {
+            stack: v,
+            logs: logs,
+            ret: ret
+        };
+        return Some(r);
     }
 
     let (opcode, _) = code.split_first().unwrap();
@@ -181,7 +225,13 @@ fn run(
     let ops = Opcodes::try_from(opcode).expect("Invalid Opcode");
 
     match ops {
-        Opcodes::STOP => return Some(v),
+        Opcodes::STOP => {
+            return Some(ExpectData {
+                stack: v,
+                logs: logs,
+                ret: ret
+            })
+        }
         Opcodes::ADD => {
             println!("ADD");
             pc += 1;
@@ -744,6 +794,91 @@ fn run(
 
             v.push(value);
         }
+
+        Opcodes::EXTCODESIZE => {
+            println!("EXTCODESIZE");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let address = get_one_mut_val(&mut v);
+            let address = format!("0x{:x}", address);
+
+            let val = match state {
+                Some(value) => {
+                    // let address_obj = value.get(address).unwrap();
+                    // let code_obj = address_obj.get("code").unwrap();
+                    // let bin = code_obj.get("bin").unwrap().as_str().unwrap();
+                    let bin = get_bin_state_data(value, &address);
+                    let code_size = bin.len() / 2;
+                    let code_size = U256::from(code_size);
+                    code_size
+                }
+                None => U256::zero(),
+            };
+
+            v.push(val);
+        }
+
+        Opcodes::EXTCODECOPY => {
+            println!("EXTCODECOPY");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let (addr, dst_ost, ost, len) = get_four_mut_val(&mut v);
+            let dst_ost = dst_ost.as_usize();
+            let ost = ost.as_usize();
+            let len = len.as_usize();
+
+            let address = format!("0x{:x}", addr);
+
+            let bin = match state {
+                Some(value) => get_bin_state_data(value, &address),
+                None => &String::new(),
+            };
+            let bin_hex = hex::decode(bin).unwrap();
+
+            let mut original_code_vec: Vec<u8> = vec![0; 32];
+            if bin.len() > 32 {
+                original_code_vec.resize((original_code.len() / 33 + 1) * 32, 0);
+            }
+
+            original_code_vec[..bin_hex.len()].copy_from_slice(&bin_hex);
+
+            let mut memory = MEMORY.lock().unwrap();
+            // let mut msize = MSIZE.lock().unwrap(); // TODO
+            let resize = ((dst_ost + 32) / 33 + 1) * 32;
+
+            if memory.len() < dst_ost + len {
+                memory.resize(resize, 0u8);
+                // *msize = first_n.len();
+            }
+
+            memory[dst_ost..dst_ost + len].copy_from_slice(&original_code_vec[ost..ost + len]);
+        }
+
+        Opcodes::EXTCODEHASH => {
+            println!("EXTCODEHASH");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let addr = get_one_mut_val(&mut v);
+            let address = format!("0x{:x}", addr);
+
+            let keccak_hash = match state {
+                Some(value) => {
+                    let bin = get_bin_state_data(value, &address);
+                    let bin_hex = hex::decode(bin).unwrap();
+                    let keccak_hash = keccak(bin_hex);
+                    U256::from(keccak_hash.0)
+                }
+                None => U256::zero(),
+            };
+            v.push(keccak_hash);
+        }
+
         Opcodes::BASEFEE => {
             println!("BASEFEE");
             pc += 1;
@@ -753,6 +888,38 @@ fn run(
             let value = get_blockchain_data(block, "basefee");
 
             v.push(value);
+        }
+
+        Opcodes::SLOAD => {
+            println!("V : {:?}", v);
+
+            println!("SLOAD");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let key = get_one_mut_val(&mut v);
+            let storage = STORAGE.lock().unwrap();
+            let val = storage.get(&key);
+            let value = match val {
+                Some(v) => v,
+                None => &U256::from(0),
+            };
+            println!("V : {:?}", v);
+
+            v.push(*value);
+        }
+
+        Opcodes::SSTORE => {
+            println!("SSTORE");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let (key, val) = get_mut_val(&mut v);
+
+            let mut storage = STORAGE.lock().unwrap();
+            let _ = storage.entry(key).insert_entry(val);
         }
 
         Opcodes::BLOCKHASH => {
@@ -826,6 +993,22 @@ fn run(
             let value = get_blockchain_data(block, "chainid");
 
             v.push(value);
+        }
+
+        Opcodes::SELFBALANCE => {
+            println!("SELFBALANCE");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let value = get_blockchain_data(tx, "to");
+            let address = format!("0x{:x}", value);
+
+            let balance = match state {
+                Some(value) => get_state_data(value, &address, "balance"),
+                None => U256::zero(),
+            };
+            v.push(balance);
         }
 
         Opcodes::JUMP => {
@@ -1022,16 +1205,132 @@ fn run(
             v.pop().unwrap();
             v.push(first_value);
         }
+
+        Opcodes::LOG0 => {
+            println!("LOG0");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let value = get_blockchain_data(tx, "to");
+            let address = format!("0x{:x}", value);
+
+            let input = pop_v(&mut v, 2);
+            let (offset, length) = (input[0], input[1]);
+
+            let memory = MEMORY.lock().unwrap();
+            let data =
+                hex::encode(&memory[offset.as_usize()..offset.as_usize() + length.as_usize()]);
+            let log = Log {
+                address,
+                data,
+                topics: vec![],
+            };
+            logs.push(log);
+        }
+        Opcodes::LOG1 => {
+            println!("LOG1");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let input = pop_v(&mut v, 3);
+            let (offset, length, topic) = (input[0], input[1], input[2]);
+
+            let value = get_blockchain_data(tx, "to");
+            let address = format!("0x{:x}", value);
+
+            let memory = MEMORY.lock().unwrap();
+            let data =
+                hex::encode(&memory[offset.as_usize()..offset.as_usize() + length.as_usize()]);
+
+            let mut topics: Vec<String> = vec![];
+            let mut bytes = [0u8; 32];
+
+            topic.to_big_endian(&mut bytes);
+            let topic = format!("0x{}", hex::encode(bytes));
+
+            topics.push(topic);
+
+            let log = Log {
+                address,
+                data,
+                topics,
+            };
+            logs.push(log);
+        }
+        Opcodes::LOGX => {
+            println!("LOGX");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let log_size: usize = (opcode - 161) as usize;
+            let n = 3 + log_size;
+
+            let input = pop_v(&mut v, n);
+            let (offset, length) = (input[0], input[1]);
+            let value = get_blockchain_data(tx, "to");
+            let address = format!("0x{:x}", value);
+
+            let memory = MEMORY.lock().unwrap();
+            let data =
+                hex::encode(&memory[offset.as_usize()..offset.as_usize() + length.as_usize()]);
+
+            let mut topics: Vec<String> = vec![];
+            for i in 2..n {
+                let topic = input[i];
+                let mut bytes = [0u8; 32];
+                topic.to_big_endian(&mut bytes);
+                let topic = format!("0x{}", hex::encode(bytes));
+                topics.push(topic);
+            }
+            let log = Log {
+                address,
+                data,
+                topics,
+            };
+            logs.push(log);
+        }
+
+        Opcodes::RETURN => {
+            println!("RETURN");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let input = pop_v(&mut v, 2);
+            let (offset, length) = (input[0], input[1]);
+
+            let memory = MEMORY.lock().unwrap();
+            let data = hex::encode(&memory[offset.as_usize()..offset.as_usize() + length.as_usize()]);
+
+            println!("data: {}", data);
+            ret.push_str(&data);
+        }
+
+        Opcodes::REVERT => {
+            println!("REVERT");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let input = pop_v(&mut v, 2);
+            let (offset, length) = (input[0], input[1]);
+
+            let memory = MEMORY.lock().unwrap();
+            let data = hex::encode(&memory[offset.as_usize()..offset.as_usize() + length.as_usize()]);
+
+            ret.push_str(&data);
+        }
+
         Opcodes::INVALID => {
             println!("INVALID");
             return None;
         }
-        _ => {
-            todo!();
-        }
     }
 
-    run(&code, pc, original_code, v, tx, block, state)
+    run(&code, pc, original_code, v, logs, ret, tx, block, state)
 }
 
 pub fn evm(
@@ -1040,15 +1339,19 @@ pub fn evm(
     block: &Option<Value>,
     state: &Option<Value>,
 ) -> EvmResult {
-    let stack: Vec<U256> = Vec::new();
+    // let stack: Vec<U256> = Vec::new();
     let v: Vec<U256> = vec![];
+    let logs: Vec<Log> = vec![];
+    let ret = String::new();
 
     let pc = 0;
     let code = code.as_ref();
-    let original_code = code.clone();
+    let original_code = code;
 
     let mut evm_result = EvmResult {
         stack: vec![],
+        logs: vec![],
+        ret: String::new(),
         success: true,
     };
     reset_memory_var();
@@ -1056,12 +1359,21 @@ pub fn evm(
 
     while pc < code.len() {
         // let opcode = code[pc];
-        let res = run(code, pc, original_code, v, tx, block, state);
+        let res = run(code, pc, original_code, v, logs, ret, tx, block, state);
 
         match res {
-            Some(mut value) => {
-                value.reverse();
-                evm_result.stack = value
+            Some(value) => {
+                let mut stack_value = value.stack;
+                let logs_value = value.logs;
+                let ret_value = value.ret;
+                stack_value.reverse();
+                evm_result.stack = stack_value;
+                evm_result.logs = logs_value;
+                evm_result.ret = ret_value.clone();
+
+                if ret_value == "f1" {
+                    evm_result.success = false
+                }
             }
             None => evm_result.success = false,
         }
@@ -1069,7 +1381,15 @@ pub fn evm(
     }
 
     return EvmResult {
-        stack: stack,
+        stack: v,
+        logs,
+        ret,
         success: false,
     };
+}
+
+struct ExpectData {
+    stack: Vec<U256>,
+    logs: Vec<Log>,
+    ret: String
 }

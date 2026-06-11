@@ -15,7 +15,6 @@
 use evm::evm;
 use primitive_types::U256;
 use serde::Deserialize;
-use std::collections::HashMap;
 #[derive(Debug, Deserialize)]
 struct Evmtest {
     name: String,
@@ -37,8 +36,16 @@ struct Code {
 struct Expect {
     stack: Option<Vec<String>>,
     success: bool,
-    // #[serde(rename = "return")]
-    // ret: Option<String>,
+    logs: Option<Vec<Log>>,
+    #[serde(rename = "return")]
+    ret: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct Log {
+    pub address: String,
+    pub data: String,
+    pub topics: Vec<String>,
 }
 
 fn main() {
@@ -61,6 +68,8 @@ fn main() {
         println!("code: {:?}", code);
 
         let result = evm(&code, tx, block, state);
+        println!("result: {:?}", result);
+
 
         let mut expected_stack: Vec<U256> = Vec::new();
         if let Some(ref stacks) = test.expect.stack {
@@ -70,8 +79,19 @@ fn main() {
         }
 
         let mut matching = result.stack.len() == expected_stack.len();
-        println!("result: {:?}", result);
 
+        let mut expected_log: Vec<Log> = Vec::new();
+        if let Some(ref stacks) = test.expect.logs {
+            for value in stacks {
+                expected_log.push(value.clone());
+            }
+        }
+
+        let mut matching_log = result.logs.len() == expected_log.len();
+        println!("result.logs: {:?}", result.logs);
+        println!("expected_log: {:?}", expected_log);
+        
+        // Matching Stack
         if matching {
             for i in 0..result.stack.len() {
                 if result.stack[i] != expected_stack[i] {
@@ -81,7 +101,31 @@ fn main() {
             }
         }
 
-        matching = matching && result.success == test.expect.success;
+        // Matching Logs
+        if matching_log {
+            for i in 0..result.logs.len() {
+                if result.logs[i].address != expected_log[i].address
+                    || result.logs[i].data != expected_log[i].data
+                    || result.logs[i].topics != expected_log[i].topics
+                {
+                    matching_log = false;
+                    break;
+                }
+                println!("result.logs {:?}", result.logs[i]);
+            }
+        }
+        println!("matching {:?}", matching);
+
+        // Matching Return
+        let expected_return = match &test.expect.ret {
+            Some(ret) => ret,
+            None => &String::new()
+        };
+
+        let matching_ret = result.ret == *expected_return;
+
+        matching = matching && matching_log && matching_ret && result.success == test.expect.success;
+        println!("matching_log {:?}", matching_log);
 
         if !matching {
             println!("Instructions: \n{}\n", test.code.asm);
@@ -92,13 +136,28 @@ fn main() {
                 println!("  {:#X},", v);
             }
             println!("]\n");
+            println!("Expected logs: [");
+            for v in expected_log {
+                println!("  {:?},", v);
+            }
+            println!("]\n");
+
+            println!("Expected Return: {:?}", expected_return);
+            println!("\n");
+
 
             println!("Actual success: {:?}", result.success);
             println!("Actual stack: [");
             for v in result.stack {
                 println!("  {:#X},", v);
             }
+            println!("Actual logs: [");
+            for v in result.logs {
+                println!("  {:?},", v);
+            }
             println!("]\n");
+            println!("Actual Return: {:?}", result.ret);
+
 
             println!("\nHint: {}\n", test.hint);
             println!("Progress: {}/{}\n\n", index, total);
