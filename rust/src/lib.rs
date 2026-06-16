@@ -1,7 +1,12 @@
 mod utils;
 
 use std::{ops::Div, str::FromStr, vec};
-
+use std::panic;
+use alloy::sol_types::Panic;
+// use anyhow::Ok;
+// use anyhow::Ok;
+use std::result::Result::Ok;
+// use anyhow::Ok;
 use keccak_hash::{self, keccak};
 use primitive_types::U256;
 use serde_json::Value;
@@ -28,6 +33,14 @@ pub struct EvmResult {
     pub logs: Vec<Log>,
     pub ret: String,
     pub success: bool,
+}
+
+#[derive(Debug)]
+enum CheckResult {
+    Success(ExpectData),       // succeeded, with data to verify
+    SuccessNoData,             // succeeded, nothing to check
+    Failure(ExpectData),       // failed (expected or not), with data
+    FailureNoData,             // failed, nothing to check
 }
 
 #[derive(Debug)]
@@ -106,7 +119,7 @@ enum Opcodes {
     LOG0,
     LOG1,
     LOGX,
-    // LOG3,
+    CALL,
     RETURN,
     REVERT,
     INVALID,
@@ -186,7 +199,7 @@ impl TryFrom<&u8> for Opcodes {
             160 => Ok(Opcodes::LOG0),
             161 => Ok(Opcodes::LOG1),
             162..=164 => Ok(Opcodes::LOGX),
-            // 163 => Ok(Opcodes::LOG3),
+            241 => Ok(Opcodes::CALL),
             243 => Ok(Opcodes::RETURN),
             253 => Ok(Opcodes::REVERT),
             254 => Ok(Opcodes::INVALID),
@@ -207,7 +220,7 @@ fn run(
     block: &Option<Value>,
     state: &Option<Value>,
     // ) -> Option<Vec<U256>> {
-) -> Option<ExpectData> {
+) -> CheckResult {
     let mut code = code;
 
     println!("begininnng code: {:?}", code);
@@ -217,7 +230,7 @@ fn run(
             logs: logs,
             ret: ret
         };
-        return Some(r);
+        return CheckResult::Success(r);
     }
 
     let (opcode, _) = code.split_first().unwrap();
@@ -226,11 +239,12 @@ fn run(
 
     match ops {
         Opcodes::STOP => {
-            return Some(ExpectData {
+            let r =  ExpectData {
                 stack: v,
                 logs: logs,
                 ret: ret
-            })
+            };
+            return CheckResult::Success(r);
         }
         Opcodes::ADD => {
             println!("ADD");
@@ -665,7 +679,10 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let value = get_blockchain_data(tx, "from");
+            let value = match state {
+                Some(_) => get_blockchain_data(tx, "to"),
+                None => get_blockchain_data(tx, "from")
+            };
 
             v.push(value);
         }
@@ -1026,7 +1043,8 @@ fn run(
                 Some(x) => {
                     code = x;
                 }
-                None => return None,
+                None => return CheckResult::FailureNoData
+                // panic!()
             }
         }
 
@@ -1151,7 +1169,7 @@ fn run(
                     Some(x) => {
                         code = x;
                     }
-                    None => return None,
+                    None => return CheckResult::FailureNoData,
                 }
             }
         }
@@ -1293,6 +1311,58 @@ fn run(
             logs.push(log);
         }
 
+        Opcodes::CALL => {
+            println!("CALL");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let input = pop_v(&mut v, 7);
+            let (gas, addr, val, argost, arglen, retost, retlen) = (input[0], input[1], input[2], input[3], input[4], input[5], input[6]);
+            println!("gas: {:?}", gas);
+            println!("addr: {:?}", addr);
+            println!("val: {:?}", val);
+            println!("argost: {:?}", argost);
+            println!("arglen: {:?}", arglen);
+            println!("retost: {:?}", retost);
+            println!("retlen: {:?}", retlen);
+           
+            let address = format!("0x{:x}", addr);
+
+            let bin = match state {
+                Some(value) => get_bin_state_data(value, &address),
+                None => &String::new(),
+            };
+            println!("bin: {}", bin);
+
+            let state_code: Vec<u8> = hex::decode(&bin).unwrap();
+
+            let check_result = run(&state_code, pc, original_code, v.clone(), logs.clone(), ret.clone(), &tx.clone(), block, state);
+
+            let memory = MEMORY.lock().unwrap();
+            println!("memory: {:?}", memory);
+
+            let result = panic::catch_unwind(|| {
+                let input_data = hex::encode(&memory[argost.as_usize()..argost.as_usize() + arglen.as_usize()]);
+                println!("input_data: {}", input_data);
+                let ret_data = hex::encode(&memory[retost.as_usize()..retost.as_usize() + retlen.as_usize()]);
+                println!("ret_data: {}", ret_data);
+            });
+
+            match (check_result, result) {
+                (CheckResult::Failure(_), _) => {
+                    v.push(U256::zero());
+                }
+                (CheckResult::FailureNoData, _) => {
+                    v.push(U256::zero());
+                }
+                (_, Err(_)) => {
+                    v.push(U256::zero());
+                }
+                (_, _) => v.push(U256::one())
+            }
+        }
+
         Opcodes::RETURN => {
             println!("RETURN");
             pc += 1;
@@ -1322,15 +1392,26 @@ fn run(
             let data = hex::encode(&memory[offset.as_usize()..offset.as_usize() + length.as_usize()]);
 
             ret.push_str(&data);
+            println!("data: {}", data);
+            // return Err()
+            let r = ExpectData {
+                stack: v,
+                logs: logs,
+                ret: ret
+            };
+            return CheckResult::Failure(r);
         }
 
         Opcodes::INVALID => {
             println!("INVALID");
-            return None;
+            // panic!();
+            return CheckResult::FailureNoData;
+
         }
     }
 
     run(&code, pc, original_code, v, logs, ret, tx, block, state)
+    
 }
 
 pub fn evm(
@@ -1357,12 +1438,20 @@ pub fn evm(
     reset_memory_var();
     reset_msize_var();
 
-    while pc < code.len() {
+    let res = while pc < code.len() {
         // let opcode = code[pc];
-        let res = run(code, pc, original_code, v, logs, ret, tx, block, state);
+        let check_result = run(code, pc, original_code, v, logs, ret, tx, block, state);
+        println!("RESULTTTT: {:?}", check_result);
 
-        match res {
-            Some(value) => {
+        // let mut res: Option<ExpectData> = None;
+
+        // let result_unwind = panic::catch_unwind(|| {
+        //     run(code, pc, original_code, v, logs, ret, tx, block, state)
+        // });
+        println!("remaining code: {:?}", code);
+
+        match check_result{
+            CheckResult::Success(value) => {
                 let mut stack_value = value.stack;
                 let logs_value = value.logs;
                 let ret_value = value.ret;
@@ -1370,15 +1459,47 @@ pub fn evm(
                 evm_result.stack = stack_value;
                 evm_result.logs = logs_value;
                 evm_result.ret = ret_value.clone();
-
-                if ret_value == "f1" {
-                    evm_result.success = false
-                }
             }
-            None => evm_result.success = false,
+            CheckResult::SuccessNoData => {}
+            CheckResult::Failure(value) => {
+                let ret_value = value.ret;
+                evm_result.ret = ret_value.clone();
+                evm_result.success = false
+            }
+            CheckResult::FailureNoData => {
+                evm_result.success = false
+            }
+
         }
-        return evm_result;
-    }
+
+
+        // match res {
+        //     Ok(result) => {
+        //         println!("result_unwind: {:?}", result);
+        //         match result {
+        //             Some(value) => {
+        //                 let mut stack_value = value.stack;
+        //                 let logs_value = value.logs;
+        //                 let ret_value = value.ret;
+        //                 stack_value.reverse();
+        //                 evm_result.stack = stack_value;
+        //                 evm_result.logs = logs_value;
+        //                 evm_result.ret = ret_value.clone();
+        //             }
+        //             None => {
+        //                 evm_result.success = false
+        //             }
+        //         }
+        //     }
+        //     Err(value) => {
+        //         let ret_value = value.unwrap().ret;
+        //         evm_result.ret = ret_value.clone();
+        //         evm_result.success = false
+        //     }
+        // }
+
+        return evm_result
+    };
 
     return EvmResult {
         stack: v,
@@ -1388,6 +1509,7 @@ pub fn evm(
     };
 }
 
+#[derive(Debug)]
 struct ExpectData {
     stack: Vec<U256>,
     logs: Vec<Log>,

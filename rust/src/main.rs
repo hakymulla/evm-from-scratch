@@ -151,6 +151,8 @@ fn main() {
             for v in result.stack {
                 println!("  {:#X},", v);
             }
+            println!("]\n");
+
             println!("Actual logs: [");
             for v in result.logs {
                 println!("  {:?},", v);
