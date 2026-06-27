@@ -50,24 +50,25 @@ pub struct Log {
 
 fn main() {
     let text = std::fs::read_to_string("../evm.json").unwrap();
-    let data: Vec<Evmtest> = serde_json::from_str(&text).unwrap();
+    let mut data: Vec<Evmtest> = serde_json::from_str(&text).unwrap();
 
     let total = data.len();
 
-    for (index, test) in data.iter().enumerate() {
+    for (index, test) in data.iter_mut().enumerate() {
         println!("Test {} of {}: {}", index + 1, total, test.name);
 
         let code: Vec<u8> = hex::decode(&test.code.bin).unwrap();
         let tx = &test.tx;
         let block = &test.block;
-        let state = &test.state;
+        // let mut state = &test.state;
         println!("tx: {:?}", tx);
         println!("block: {:?}", block);
 
         println!("test.code.bin: {:?}", test.code.bin);
         println!("code: {:?}", code);
 
-        let result = evm(&code, tx, block, state);
+        // let result = evm(&code, tx, block, state);
+        let result = evm(&code, tx, block, &mut test.state);
         println!("result: {:?}", result);
 
 

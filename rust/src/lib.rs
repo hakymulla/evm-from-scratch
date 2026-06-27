@@ -1,52 +1,31 @@
 mod utils;
+mod types;
 
 use std::{ops::Div, str::FromStr, vec};
 use std::panic;
-use alloy::sol_types::Panic;
 // use anyhow::Ok;
 // use anyhow::Ok;
 use std::result::Result::Ok;
+use ethers::core::k256::elliptic_curve::consts::U2;
+use ethers::utils::hex::encode;
 // use anyhow::Ok;
 use keccak_hash::{self, keccak};
+// use rlp::{self, Rlp};
+use rlp::RlpStream;
+
+// use ethers::core::utils::rlp;
 use primitive_types::U256;
 use serde_json::Value;
+use serde_json::json;
 
 use utils::{
     get_bin_state_data, get_blockchain_data, get_four_mut_val, get_mut_val, get_n_bytes,
-    get_one_mut_val, get_state_data, get_three_mut_val, jump, reset_memory_var, reset_msize_var,
-    to_signed, to_unsigned, MEMORY, MSIZE, STORAGE,
+    get_one_mut_val, get_state_data, get_three_mut_val, is_static_violation, jump, reset_memory_var, reset_msize_var, 
+    to_signed, to_unsigned, MEMORY, MSIZE, RETURNDATA, STORAGE,
 };
 
-use crate::utils::pop_v;
-use serde::Deserialize;
-
-#[derive(Deserialize, Debug, Clone)]
-pub struct Log {
-    pub address: String,
-    pub data: String,
-    pub topics: Vec<String>,
-}
-
-#[derive(Debug)]
-pub struct EvmResult {
-    pub stack: Vec<U256>,
-    pub logs: Vec<Log>,
-    pub ret: String,
-    pub success: bool,
-}
-
-#[derive(Debug)]
-enum CheckResult {
-    Success(ExpectData),       // succeeded, with data to verify
-    SuccessNoData,             // succeeded, nothing to check
-    Failure(ExpectData),       // failed (expected or not), with data
-    FailureNoData,             // failed, nothing to check
-}
-
-#[derive(Debug)]
-enum EvmError {
-    OpCodeError(String),
-}
+use crate::utils::{pop_v, reset_return_data};
+use types::{CheckResult,EvmResult, EvmError, ExpectData, Log};
 
 #[derive(Debug)]
 enum Opcodes {
@@ -90,6 +69,8 @@ enum Opcodes {
     GASPRICE,
     EXTCODESIZE,
     EXTCODECOPY,
+    RETURNDATASIZE,
+    RETURNDATACOPY,
     EXTCODEHASH,
     BLOCKHASH,
     COINBASE,
@@ -119,8 +100,11 @@ enum Opcodes {
     LOG0,
     LOG1,
     LOGX,
+    CREATE,
     CALL,
     RETURN,
+    DELEGATECALL,
+    STATICCALL,
     REVERT,
     INVALID,
 }
@@ -170,6 +154,8 @@ impl TryFrom<&u8> for Opcodes {
             58 => Ok(Opcodes::GASPRICE),
             59 => Ok(Opcodes::EXTCODESIZE),
             60 => Ok(Opcodes::EXTCODECOPY),
+            61 => Ok(Opcodes::RETURNDATASIZE),
+            62 => Ok(Opcodes::RETURNDATACOPY),
             63 => Ok(Opcodes::EXTCODEHASH),
             64 => Ok(Opcodes::BLOCKHASH),
             65 => Ok(Opcodes::COINBASE),
@@ -199,8 +185,11 @@ impl TryFrom<&u8> for Opcodes {
             160 => Ok(Opcodes::LOG0),
             161 => Ok(Opcodes::LOG1),
             162..=164 => Ok(Opcodes::LOGX),
+            240 => Ok(Opcodes::CREATE),
             241 => Ok(Opcodes::CALL),
             243 => Ok(Opcodes::RETURN),
+            244 => Ok(Opcodes::DELEGATECALL),
+            250 => Ok(Opcodes::STATICCALL),
             253 => Ok(Opcodes::REVERT),
             254 => Ok(Opcodes::INVALID),
 
@@ -209,7 +198,7 @@ impl TryFrom<&u8> for Opcodes {
     }
 }
 
-fn run(
+fn run<>(
     code: &[u8],
     mut pc: usize,
     original_code: &[u8],
@@ -218,8 +207,7 @@ fn run(
     mut ret: String,
     tx: &Option<Value>,
     block: &Option<Value>,
-    state: &Option<Value>,
-    // ) -> Option<Vec<U256>> {
+    state: &mut Option<Value>,
 ) -> CheckResult {
     let mut code = code;
 
@@ -280,8 +268,6 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let (a, b) = get_mut_val(&mut v);
-            println!("a : {:?}", a);
-            println!("b : {:?}", b);
             if b == U256::zero() {
                 v.push(U256::zero());
             } else {
@@ -295,8 +281,6 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
             let (a, b) = get_mut_val(&mut v);
-            println!("a : {:?}", a);
-            println!("b : {:?}", b);
             let (a_neg, a_mag) = to_signed(a);
             let (b_neg, b_mag) = to_signed(b);
 
@@ -641,7 +625,7 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let value = get_blockchain_data(tx, "to");
+            let value = get_blockchain_data(tx, "to").unwrap();
 
             v.push(value);
         }
@@ -652,8 +636,22 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let address = get_one_mut_val(&mut v);
+            let mut address = get_one_mut_val(&mut v);
+            println!("address in BALANCE: {}", address);
+            if address == U256::max_value() {
+                address = match state {
+                    Some(_) => get_blockchain_data(tx, "to").unwrap(),
+                    None => get_blockchain_data(tx, "from").unwrap()
+                };
+                println!("address in BALANCE: {}", address);
+
+            }
+                println!("address in BALANCE: {}", address);
+
+
             let address = format!("0x{:x}", address);
+                println!("address in BALANCE: {}", address);
+
             let balance = match state {
                 Some(value) => get_state_data(value, &address, "balance"),
                 None => U256::zero(),
@@ -668,7 +666,7 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let value = get_blockchain_data(tx, "origin");
+            let value = get_blockchain_data(tx, "origin").unwrap();
 
             v.push(value);
         }
@@ -680,8 +678,8 @@ fn run(
             code = new_code;
 
             let value = match state {
-                Some(_) => get_blockchain_data(tx, "to"),
-                None => get_blockchain_data(tx, "from")
+                Some(_) => get_blockchain_data(tx, "to").unwrap(),
+                None => get_blockchain_data(tx, "from").unwrap()
             };
 
             v.push(value);
@@ -693,7 +691,7 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let value = get_blockchain_data(tx, "value");
+            let value = get_blockchain_data(tx, "value").unwrap();
 
             v.push(value);
         }
@@ -705,7 +703,7 @@ fn run(
             code = new_code;
 
             let idx = get_one_mut_val(&mut v).as_usize();
-            let value = get_blockchain_data(tx, "data");
+            let value = get_blockchain_data(tx, "data").unwrap();
             let value_str = format!("000{:x}", value);
 
             let data = hex::decode(value_str).unwrap();
@@ -731,7 +729,7 @@ fn run(
 
             let size = match tx {
                 Some(tx) => {
-                    let data = get_blockchain_data(&Some(tx.clone()), "data");
+                    let data = get_blockchain_data(&Some(tx.clone()), "data").unwrap();
                     let data_str = format!("000{:x}", data);
                     data_str.len() / 2
                 }
@@ -747,7 +745,7 @@ fn run(
             code = new_code;
 
             let (dst_ost, ost, len) = get_three_mut_val(&mut v);
-            let data = get_blockchain_data(tx, "data");
+            let data = get_blockchain_data(tx, "data").unwrap();
             let mut bytes = [0u8; 32];
             data.to_big_endian(&mut bytes);
 
@@ -807,7 +805,7 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let value = get_blockchain_data(tx, "gasprice");
+            let value = get_blockchain_data(tx, "gasprice").unwrap();
 
             v.push(value);
         }
@@ -842,37 +840,155 @@ fn run(
             pc += 1;
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
+            println!("EXTCODECOPY");
 
-            let (addr, dst_ost, ost, len) = get_four_mut_val(&mut v);
+            let addr = match state {
+                Some(_) => get_blockchain_data(tx, "to").unwrap(),
+                None => get_blockchain_data(tx, "from").unwrap()
+            };
+
+            let mut address = U256::default();
+            let mut ost = U256::default();
+            let mut len = U256::default();
+            let mut dst_ost = U256::default();
+
+            if addr == U256::default() {
+                let (address_val, dst_ost_val, ost_val, len_val) = get_four_mut_val(&mut v);
+                address = address_val;
+                ost = ost_val;
+                len = len_val;
+                dst_ost = dst_ost_val;
+            } else {
+                let (dst_ost_val, ost_val, len_val) = get_three_mut_val(&mut v);
+                println!("addr extcode: {}", addr);
+                address = addr;
+                ost = ost_val;
+                len = len_val;
+                dst_ost = dst_ost_val;
+            }
+
+            println!("address extcode: {}", address);
+            println!("dst_ost: {}", dst_ost);
+            println!("ost: {}", ost);
+            println!("len: {}", len);
+
             let dst_ost = dst_ost.as_usize();
             let ost = ost.as_usize();
             let len = len.as_usize();
 
-            let address = format!("0x{:x}", addr);
-
-            let bin = match state {
-                Some(value) => get_bin_state_data(value, &address),
-                None => &String::new(),
-            };
-            let bin_hex = hex::decode(bin).unwrap();
-
-            let mut original_code_vec: Vec<u8> = vec![0; 32];
-            if bin.len() > 32 {
-                original_code_vec.resize((original_code.len() / 33 + 1) * 32, 0);
+            if address == U256::max_value() {
+                address = match state {
+                    Some(_) => get_blockchain_data(tx, "to").unwrap(),
+                    None => get_blockchain_data(tx, "from").unwrap()
+                };
+                println!("address in BALANCE: {}", address);
             }
 
-            original_code_vec[..bin_hex.len()].copy_from_slice(&bin_hex);
+            let address = format!("0x{:x}", address);
+
+            let code_bytes = match state {
+                Some(s) => hex::decode(get_bin_state_data(s, &address)).ok().unwrap_or_default(),
+                    // .and_then(|bin| hex::decode(bin).ok())
+                    // .unwrap_or_default(),
+                None => vec![],  // ← no state = empty code
+            };
 
             let mut memory = MEMORY.lock().unwrap();
-            // let mut msize = MSIZE.lock().unwrap(); // TODO
-            let resize = ((dst_ost + 32) / 33 + 1) * 32;
 
-            if memory.len() < dst_ost + len {
-                memory.resize(resize, 0u8);
-                // *msize = first_n.len();
+            println!("code_bytes in extcode: {:?}", code_bytes);
+            println!("memory in extcode: {:?}", memory);
+
+            // expand memory if needed
+            let required = dst_ost + len;
+            if required > 0 {
+                let words = (required + 31) / 32;
+                if memory.len() < words * 32 {
+                    memory.resize(words * 32, 0u8);
+                }
             }
 
-            memory[dst_ost..dst_ost + len].copy_from_slice(&original_code_vec[ost..ost + len]);
+            // copy bytes, zero-pad if offset+size exceeds code length
+            for i in 0..len {
+                let code_idx = ost + i;
+                memory[ost + i] = if code_idx < code_bytes.len() {
+                    code_bytes[code_idx]
+                } else {
+                    0x00  // ← out of bounds = 0
+                };
+            }
+
+            // let bin = match state {
+            //     Some(value) => get_bin_state_data(value, &address),
+            //     None => &String::new(),
+            // };
+            // let bin_hex = hex::decode(bin).unwrap();
+
+            // let mut original_code_vec: Vec<u8> = vec![0; 32];
+            // if bin.len() > 32 {
+            //     original_code_vec.resize((original_code.len() / 33 + 1) * 32, 0);
+            // }
+
+            // original_code_vec[..bin_hex.len()].copy_from_slice(&bin_hex);
+
+            // let mut memory = MEMORY.lock().unwrap();
+            // // let mut msize = MSIZE.lock().unwrap(); // TODO
+            // let resize = ((dst_ost + 32) / 33 + 1) * 32;
+
+            // if memory.len() < dst_ost + len {
+            //     memory.resize(resize, 0u8);
+            //     // *msize = first_n.len();
+            // }
+
+            // memory[dst_ost..dst_ost + len].copy_from_slice(&original_code_vec[ost..ost + len]);
+        }
+
+        Opcodes::RETURNDATASIZE => {
+            println!("RETURNDATASIZE");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+            println!("CODE:{:?}", code);
+
+
+            let return_data = RETURNDATA.lock().unwrap();
+            println!("return_data v: {:?}", return_data);
+
+            if return_data.logs.is_empty() && return_data.ret.is_empty() && return_data.stack.is_empty(){
+                v.push(U256::zero());
+            } else if !return_data.ret.is_empty() {
+                let byte_size = return_data.ret.as_bytes().len() / 2;
+                v.push(U256::from(byte_size));
+            } else {
+                let n = return_data.stack.first().unwrap();
+                let byte_size = (n.bits() + 7) / 8;
+                v.push(U256::from(byte_size));
+            }
+        }
+
+        Opcodes::RETURNDATACOPY => {
+            println!("RETURNDATACOPY");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let input = pop_v(&mut v, 3);
+            let (dst_ost, ost, len) = (input[0], input[1], input[2]);
+            let dst_ost = dst_ost.as_usize();
+            let len = len.as_usize();
+            let ost: usize = ost.as_usize();
+
+            let return_data = RETURNDATA.lock().unwrap();
+            let return_data_bytes = hex::decode(&return_data.ret).unwrap();
+
+            let mut memory = MEMORY.lock().unwrap();
+
+            let resize = ((dst_ost + 32) / 33 + 1) * 32;
+
+            if memory.len() < resize {
+                memory.resize(resize, 0u8);
+            }
+
+            memory[dst_ost..dst_ost + len].copy_from_slice(&return_data_bytes[ost..]);
         }
 
         Opcodes::EXTCODEHASH => {
@@ -902,7 +1018,7 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let value = get_blockchain_data(block, "basefee");
+            let value = get_blockchain_data(block, "basefee").unwrap();
 
             v.push(value);
         }
@@ -956,7 +1072,7 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let value = get_blockchain_data(block, "coinbase");
+            let value = get_blockchain_data(block, "coinbase").unwrap();
 
             v.push(value);
         }
@@ -967,7 +1083,7 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let value = get_blockchain_data(block, "timestamp");
+            let value = get_blockchain_data(block, "timestamp").unwrap();
 
             v.push(value);
         }
@@ -977,7 +1093,7 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let value = get_blockchain_data(block, "number");
+            let value = get_blockchain_data(block, "number").unwrap();
 
             v.push(value);
         }
@@ -987,7 +1103,7 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let value = get_blockchain_data(block, "difficulty");
+            let value = get_blockchain_data(block, "difficulty").unwrap();
 
             v.push(value);
         }
@@ -997,7 +1113,7 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let value = get_blockchain_data(block, "gaslimit");
+            let value = get_blockchain_data(block, "gaslimit").unwrap();
 
             v.push(value);
         }
@@ -1007,7 +1123,7 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let value = get_blockchain_data(block, "chainid");
+            let value = get_blockchain_data(block, "chainid").unwrap();
 
             v.push(value);
         }
@@ -1018,7 +1134,7 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let value = get_blockchain_data(tx, "to");
+            let value = get_blockchain_data(tx, "to").unwrap();
             let address = format!("0x{:x}", value);
 
             let balance = match state {
@@ -1127,7 +1243,7 @@ fn run(
 
             let required = offset + 32;
             let mut memory = MEMORY.lock().unwrap();
-            if memory[offset..].len() < required {
+            if memory.len() < required {
                 memory.resize(required, 0u8);
             }
             memory[offset..offset + 32].copy_from_slice(&bytes);
@@ -1230,7 +1346,7 @@ fn run(
             let (_, new_code) = get_n_bytes(&code, 1);
             code = new_code;
 
-            let value = get_blockchain_data(tx, "to");
+            let value = get_blockchain_data(tx, "to").unwrap();
             let address = format!("0x{:x}", value);
 
             let input = pop_v(&mut v, 2);
@@ -1255,7 +1371,7 @@ fn run(
             let input = pop_v(&mut v, 3);
             let (offset, length, topic) = (input[0], input[1], input[2]);
 
-            let value = get_blockchain_data(tx, "to");
+            let value = get_blockchain_data(tx, "to").unwrap();
             let address = format!("0x{:x}", value);
 
             let memory = MEMORY.lock().unwrap();
@@ -1288,7 +1404,7 @@ fn run(
 
             let input = pop_v(&mut v, n);
             let (offset, length) = (input[0], input[1]);
-            let value = get_blockchain_data(tx, "to");
+            let value = get_blockchain_data(tx, "to").unwrap();
             let address = format!("0x{:x}", value);
 
             let memory = MEMORY.lock().unwrap();
@@ -1311,6 +1427,53 @@ fn run(
             logs.push(log);
         }
 
+        Opcodes::CREATE => {
+            println!("CREATE");
+            println!("v: {:?}", v);
+
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let input = pop_v(&mut v, 3);
+            let (value, offset, length,) = (input[0], input[1], input[2]);
+            println!("value: {:?}", value);
+            println!("offset: {:?}", offset);
+            println!("length: {:?}", length);
+
+            let addr = get_blockchain_data(tx, "to").unwrap();
+            let address = format!("{:x}", addr);
+            println!("address: {:?}", address);
+            println!("value: {:?}", value);
+
+
+            let memory = MEMORY.lock().unwrap();
+            println!("memory: {:?}", memory);
+
+            let data = hex::encode(&memory[offset.as_usize()..offset.as_usize() + length.as_usize()]);
+
+            let address_bytes = hex::decode(&address).unwrap();
+            let nonce: u8 = 0;
+            let mut stream = RlpStream::new_list(2);
+            stream.append(&address_bytes);
+            stream.append(&nonce);
+            let rlp_encode = stream.out();
+
+            let contract_address = hex::encode(&keccak(&rlp_encode)[12..]);
+            println!("{:?}", contract_address);
+
+            let new_state: Option<serde_json::Value> = Some(json!({
+                format!("0x{:x}", addr): {
+                    "balance": value
+                }
+            }));
+
+
+            *state = new_state;
+
+            println!("state: {:?}", state);
+        }
+
         Opcodes::CALL => {
             println!("CALL");
             pc += 1;
@@ -1319,13 +1482,6 @@ fn run(
 
             let input = pop_v(&mut v, 7);
             let (gas, addr, val, argost, arglen, retost, retlen) = (input[0], input[1], input[2], input[3], input[4], input[5], input[6]);
-            println!("gas: {:?}", gas);
-            println!("addr: {:?}", addr);
-            println!("val: {:?}", val);
-            println!("argost: {:?}", argost);
-            println!("arglen: {:?}", arglen);
-            println!("retost: {:?}", retost);
-            println!("retlen: {:?}", retlen);
            
             let address = format!("0x{:x}", addr);
 
@@ -1333,25 +1489,31 @@ fn run(
                 Some(value) => get_bin_state_data(value, &address),
                 None => &String::new(),
             };
-            println!("bin: {}", bin);
 
             let state_code: Vec<u8> = hex::decode(&bin).unwrap();
 
             let check_result = run(&state_code, pc, original_code, v.clone(), logs.clone(), ret.clone(), &tx.clone(), block, state);
 
             let memory = MEMORY.lock().unwrap();
-            println!("memory: {:?}", memory);
 
             let result = panic::catch_unwind(|| {
                 let input_data = hex::encode(&memory[argost.as_usize()..argost.as_usize() + arglen.as_usize()]);
-                println!("input_data: {}", input_data);
                 let ret_data = hex::encode(&memory[retost.as_usize()..retost.as_usize() + retlen.as_usize()]);
-                println!("ret_data: {}", ret_data);
             });
 
+            let mut return_data = RETURNDATA.lock().unwrap();
+            return_data.logs.clear();
+            return_data.ret.clear();
+            return_data.stack.clear();
+
             match (check_result, result) {
-                (CheckResult::Failure(_), _) => {
+                (CheckResult::Success(data), _) => {
+                    v.push(U256::one());
+                    *return_data = data;
+                }
+                (CheckResult::Failure(data), _) => {
                     v.push(U256::zero());
+                    *return_data = data;
                 }
                 (CheckResult::FailureNoData, _) => {
                     v.push(U256::zero());
@@ -1377,6 +1539,83 @@ fn run(
 
             println!("data: {}", data);
             ret.push_str(&data);
+        }
+
+        Opcodes::DELEGATECALL => {
+            println!("DELEGATECALL");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let input = pop_v(&mut v, 6);
+            let (gas, addr, argost, arglen, retost, retlen) = (input[0], input[1], input[2], input[3], input[4], input[5]);
+            let addr = format!("0x{:x}", addr);
+
+            let value = get_blockchain_data(tx, "to").unwrap();
+            let address = format!("0x{:x}", value);
+
+            let bin = match state {
+                Some(value) => get_bin_state_data(value, &addr),
+                None => &String::new(),
+            };
+            println!("bin: {}", bin);
+
+            let state_code: Vec<u8> = hex::decode(&bin).unwrap();
+            let check_result = run(&state_code, pc, original_code, v.clone(), logs.clone(), ret.clone(), &tx.clone(), block, state);
+            match check_result{
+                CheckResult::Success(_) => {
+                    v.push(U256::one());
+                }
+                CheckResult::SuccessNoData => {
+                    v.push(U256::one());
+                }
+                _ => {
+                    v.push(U256::zero());
+                }
+            }
+        }
+
+         Opcodes::STATICCALL => {
+            println!("STATICCALL");
+            pc += 1;
+            let (_, new_code) = get_n_bytes(&code, 1);
+            code = new_code;
+
+            let input = pop_v(&mut v, 6);
+            let (gas, addr, argost, arglen, retost, retlen) = (input[0], input[1], input[2], input[3], input[4], input[5]);
+            let addr = format!("0x{:x}", addr);
+
+            let bin = match state {
+                Some(value) => get_bin_state_data(value, &addr),
+                None => &String::new(),
+            };
+            println!("bin: {}", bin);
+
+            let state_code: Vec<u8> = hex::decode(&bin).unwrap();
+            println!("bin: {:?}", bin);
+            println!("state_code: {:?}", state_code);
+            println!("before check result: {:?}", opcode);
+            if is_static_violation(&state_code) {
+                v.push(U256::zero());
+            } else {
+                let check_result = run(&state_code, pc, original_code, v.clone(), logs.clone(), ret.clone(), &tx.clone(), block, state);
+                println!("after check result: {:?}", opcode);
+
+                println!("check_result: {:?}", check_result);
+
+                match check_result{
+                    CheckResult::Success(_) => {
+                        v.push(U256::one());
+                    }
+                    CheckResult::SuccessNoData => {
+                        v.push(U256::one());
+                    }
+                    _ => {
+                        v.push(U256::zero());
+                    }
+                }
+            }
+            
         }
 
         Opcodes::REVERT => {
@@ -1418,7 +1657,7 @@ pub fn evm(
     code: impl AsRef<[u8]>,
     tx: &Option<Value>,
     block: &Option<Value>,
-    state: &Option<Value>,
+    state: &mut Option<Value>,
 ) -> EvmResult {
     // let stack: Vec<U256> = Vec::new();
     let v: Vec<U256> = vec![];
@@ -1437,8 +1676,9 @@ pub fn evm(
     };
     reset_memory_var();
     reset_msize_var();
+    reset_return_data();
 
-    let res = while pc < code.len() {
+    let _ = while pc < code.len() {
         // let opcode = code[pc];
         let check_result = run(code, pc, original_code, v, logs, ret, tx, block, state);
         println!("RESULTTTT: {:?}", check_result);
@@ -1509,9 +1749,3 @@ pub fn evm(
     };
 }
 
-#[derive(Debug)]
-struct ExpectData {
-    stack: Vec<U256>,
-    logs: Vec<Log>,
-    ret: String
-}
